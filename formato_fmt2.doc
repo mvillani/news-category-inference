@@ -11,3 +11,41 @@ Struttura  del formato fmt2:
         dataset: contenente metadati sul dataset di test (es. total_records: 1000).
 
     Contenuto di results: lista di oggetti record contenenti id, status ("ok" o "error"), source_text, true_category, pred_category, pred_raw e latency_seconds.
+
+Esempio:
+
+{
+  "metadata": {
+    "model": {
+      "provider": "openai",
+      "model_id": "gpt-4o-mini"
+    },
+    "protocol": {
+      "mode": "semantic_fewshot_reject",
+      "experiment_tag": "news1000",
+      "dropped_class": "attualita",
+      "rejection_label": "non_classificabile"
+    },
+    "dataset": {
+      "total_records": 1000
+    }
+  },
+  "results": [
+    {
+      "id": "114",
+      "status": "ok",
+      "source_text": "Il legale di Ara Zobayan, il pilota scomparso nell'incidente che ha ucciso Kobe Bryant, la figlia Gianna e altri sei passeggeri, secondo quanto riferisce ‘Tmz', ha dichiarato che tutte le persone che erano a bordo di quel volo sapevano che viaggiare in quelle condizioni era molto pericoloso. L'avvocato della famiglia di Ara Zobayan, citato in giudizio da Vanessa Bryant, la vedova di Kobe e dai familiari delle altre persone decedute, in una delle udienze del processo per la morte di Kobe Bryant, della figlia Gianna e di altre sei persone ha dichiarato che tuti i passeggeri erano ben consapevoli e sapevano che volando con quelle difficili condizioni avrebbero potuto rischiare molto: \"Tutti conoscevano i rischi e tale negligenza è stata un fattore sostanziale nel causare l'incidente\". Già in precedenza il fratello del pilota morte con Kobe in California aveva depositato un documento in cui è scritto che tutti quelle che viaggiavano su quell'elicottero correvano dei rischi ma nonostante ciò hanno deciso di volare.",
+      "true_category": "sport",
+      "original_true_category": "sport",
+      "pred_category": "diritto",
+      "pred_raw": "diritto",
+      "latency_seconds": 2.0363,
+      "prompt_tokens": 773,
+      "completion_tokens": 2
+    },
+    {
+     <...>
+    }
+  ]
+}
+
