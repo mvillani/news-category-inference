@@ -1,0 +1,13 @@
+Struttura  del formato fmt2:
+
+    Struttura del file JSON: radice composta da due blocchi primari, metadata e results.
+
+    Contenuto di metadata:
+
+        model: contenente provider (es. "deepinfra") e model_id (es. "meta-llama/Llama-3.3-70B-Instruct").
+
+        protocol: contenente mode ("0shot", "fewshot"), experiment_tag (es. "news1000") e input_column ("source").
+
+        dataset: contenente metadati sul dataset di test (es. total_records: 1000).
+
+    Contenuto di results: lista di oggetti record contenenti id, status ("ok" o "error"), source_text, true_category, pred_category, pred_raw e latency_seconds.
