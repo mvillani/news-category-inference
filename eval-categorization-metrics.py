@@ -1,58 +1,23 @@
-# ================================================================================
-# SCRIPT BATCH INFERENZA SINCRONA (0-SHOT & FEW-SHOT) - FORMATO FMT2
-# Benchmark Dataset: fanpage_test_1000.csv (1.000 articoli - 18 classi)
-# Pool Few-Shot: fanpage_train_800.csv
-# ================================================================================
+# ==============================================================================
+# SCRIPT BATCH METRICHE FORMATO FMT2 (SPECIFICO PER NEWS1000)
+# ==============================================================================
 
+import glob
 import json
 import os
-import re
 import sys
-import time
 import pandas as pd
-
-try:
-    from openai import OpenAI
-except ImportError:
-    print('❌ Libreria openai non installata o datata. Esegui: pip install -q --upgrade openai')
-    sys.exit(1)
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 # ==============================================================================
-# 1. SETUP DEEPINFRA & CONFIGURAZIONE ESPERIMENTO
+# CONFIGURAZIONE
 # ==============================================================================
-try:
-    from google.colab import userdata
-    deepinfra_api_key = userdata.get('DEEPINFRA_API_KEY')
-except Exception:
-    deepinfra_api_key = os.environ.get('DEEPINFRA_API_KEY') or os.environ.get('DEEPINFRA_TOKEN')
+CHECKPOINT_DIR = "fanpage_categorization_eval"
+OUTPUT_SUMMARY_CSV = "metrics_summary_news1000_fmt2.csv"
+CATEGORIES_FILE = "main_categories.txt"
 
-if not deepinfra_api_key:
-    deepinfra_api_key = input('⚠️ Inserisci la tua DEEPINFRA_API_KEY: ')
-
-client = OpenAI(
-    base_url='https://api.deepinfra.com/v1/openai',
-    api_key=deepinfra_api_key,
-)
-
-# Modalità di esperimento: "0shot" oppure "fewshot"
-EXECUTION_MODE = "0shot"     
-
-# Identificativo dell'esperimento per il formato fmt2
-EXPERIMENT_TAG = "news1000"  
-
-CHECKPOINT_EVERY = 20        # Frequenza di salvataggio del checkpoint su disco
-
-MODELS_TO_TEST = [
-    "meta-llama/Llama-3.3-70B-Instruct",
-    "meta-llama/Meta-Llama-3.1-8B-Instruct",
-    "google/gemma-3-27b-it"
-]
-
-TEST_DATASET_PATH = 'fanpage_test_1000.csv'
-TRAIN_DATASET_PATH = 'fanpage_train_800.csv'
-CATEGORIES_FILE = 'main_categories.txt'
-CHECKPOINT_DIR = 'fanpage_categorization_eval'
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+# Tag di filtro per processare solo il benchmark a 1000 articoli
+EXPERIMENT_FILTER_TAG = "news1000"
 
 # Tassonomia 18 classi
 DEFAULT_CATEGORIES = [
@@ -63,234 +28,131 @@ DEFAULT_CATEGORIES = [
 
 if os.path.exists(CATEGORIES_FILE):
     with open(CATEGORIES_FILE, 'r', encoding='utf-8') as f:
-        CATEGORIES = [line.strip().lower() for line in f if line.strip()]
+        CATEGORIES = sorted([line.strip().lower() for line in f if line.strip()])
 else:
-    CATEGORIES = DEFAULT_CATEGORIES
+    CATEGORIES = sorted(DEFAULT_CATEGORIES)
 
 
 # ==============================================================================
-# 2. HELPER FUNZIONI PROMPT & NORMALIZZAZIONE
+# ESTRAZIONE METRICHE DA CHECKPOINT FMT2
 # ==============================================================================
-def load_fewshot_exemplars(train_path: str, n_shots_per_class: int = 1) -> str:
-    """Carica gli esempi per il few-shot dal dataset train_800."""
-    if not os.path.exists(train_path):
-        print(f"⚠️ Dataset train non trovato ({train_path}). Procedo in 0-shot.")
-        return ""
-    
-    df_train = pd.read_csv(train_path)
-    exemplars = []
-    
-    for cat in CATEGORIES:
-        sample_rows = df_train[df_train['category'].str.strip().str.lower() == cat].head(n_shots_per_class)
-        for _, row in sample_rows.iterrows():
-            text_snippet = str(row['source']).strip()
-            if len(text_snippet) > 400:
-                text_snippet = text_snippet[:400] + "..."
-            exemplars.append(f"Testo: \"{text_snippet}\"\nCategoria: {cat}")
-            
-    return "\n\n".join(exemplars)
+def evaluate_checkpoint_fmt2(filepath: str) -> dict:
+    """Legge un file JSON in formato fmt2 e calcola le metriche di classificazione."""
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
+    metadata = data.get("metadata", {})
+    results = data.get("results", [])
 
-def build_prompt(news_text: str, mode: str = "0shot", fewshot_context: str = "") -> str:
-    """Costruisce il prompt in base al protocollo."""
-    categories_str = ", ".join(CATEGORIES)
-    
-    if mode == "fewshot" and fewshot_context:
-        return (
-            "Classifica i testi informativi scegliendo UNA SOLA categoria tra quelle presenti in questa lista:\n"
-            f"[{categories_str}]\n\n"
-            "Di seguito sono forniti alcuni esempi di classificazione:\n\n"
-            f"{fewshot_context}\n\n"
-            "Ora classifica il seguente nuovo testo:\n"
-            f'Testo: "{news_text}"\n\n'
-            "Rispondi SOLTANTO con il nome della categoria scelta, senza punteggiatura o parole aggiuntive.\n"
-            "Categoria:"
-        )
-    
-    return (
-        "Classifica il seguente testo informativo scegliendo UNA SOLA categoria "
-        f"tra quelle presenti in questa lista: [{categories_str}].\n\n"
-        f'Testo: "{news_text}"\n\n'
-        "Rispondi SOLTANTO con il nome della categoria scelta, senza punteggiatura o parole aggiuntive.\n"
-        "Categoria:"
-    )
+    # Estrazione metadati fmt2
+    model_id = metadata.get("model", {}).get("model_id", os.path.basename(filepath))
+    provider = metadata.get("model", {}).get("provider", "N/A")
+    protocol_mode = metadata.get("protocol", {}).get("mode", "N/A")
+    experiment_tag = metadata.get("protocol", {}).get("experiment_tag", "N/A")
+    total_records = metadata.get("dataset", {}).get("total_records", len(results))
 
+    y_true = []
+    y_pred = []
+    latencies = []
+    error_count = 0
 
-def predict_category(prompt: str, model_name: str) -> tuple[str, float]:
-    """Chiamata API DeepInfra sincrona con retry ed exponential backoff."""
-    t0 = time.time()
-    for attempt in range(1, 6):
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=15
-            )
-            latency = time.time() - t0
-            raw_response = response.choices[0].message.content.strip()
-            return raw_response, latency
+    for r in results:
+        if r.get("status") == "ok":
+            y_true.append(str(r["true_category"]).strip().lower())
+            y_pred.append(str(r["pred_category"]).strip().lower())
+            if "latency_seconds" in r:
+                latencies.append(r["latency_seconds"])
+        else:
+            error_count += 1
 
-        except Exception as e:
-            wait_time = 3.0 * (2 ** (attempt - 1))
-            print(f"\n⚠️ [ERRORE API] (Tentativo {attempt}/5). Attendo {wait_time}s... Errore: {e}")
-            time.sleep(wait_time)
-
-    return "ERRORE", time.time() - t0
-
-
-def clean_and_map_category(raw_pred: str) -> str:
-    """Pulizia e verifica dell'etichetta predetta dall'LLM."""
-    if not isinstance(raw_pred, str) or not raw_pred.strip():
-        return "ALTRO"
-    
-    clean = raw_pred.lower().strip()
-    clean = re.sub(r'^[^\w]+|[^\w]+$', '', clean)
-    
-    if clean in CATEGORIES:
-        return clean
-    
-    for cat in CATEGORIES:
-        if cat in clean:
-            return cat
-            
-    return "ALTRO"
-
-
-# ==============================================================================
-# 3. PIPELINE DI ESECUZIONE (FORMATO FMT2)
-# ==============================================================================
-def main():
-    if not os.path.exists(TEST_DATASET_PATH):
-        print(f"❌ File di test non trovato: {TEST_DATASET_PATH}.")
-        sys.exit(1)
-
-    df_test = pd.read_csv(TEST_DATASET_PATH)
-    total_records = len(df_test)
-
-    print(f"📊 Dataset Test Caricato: {total_records} articoli da '{TEST_DATASET_PATH}'.")
-    print(f"🏷️ Numero Categorie Tassonomia: {len(CATEGORIES)}")
-    print(f"⚙️ Formato: [FMT2] | Protocollo: [{EXECUTION_MODE.upper()}-{EXPERIMENT_TAG.upper()}] | Salvataggio ogni: {CHECKPOINT_EVERY} record")
-
-    fewshot_context = ""
-    if EXECUTION_MODE == "fewshot":
-        fewshot_context = load_fewshot_exemplars(TRAIN_DATASET_PATH, n_shots_per_class=1)
-        print(f"💡 Contesto Few-Shot caricato da '{TRAIN_DATASET_PATH}'.")
-
-    for selected_model in MODELS_TO_TEST:
-        model_slug = selected_model.replace('/', '_').replace('-', '_').replace('.', '_')
-        checkpoint_file = os.path.join(
-            CHECKPOINT_DIR, 
-            f'checkpoint-{EXECUTION_MODE}-{EXPERIMENT_TAG}-{model_slug}.json'
-        )
-
-        print("\n" + "=" * 80)
-        print(f"🚀 AVVIO ESPERIMENTO [{EXECUTION_MODE.upper()}-{EXPERIMENT_TAG.upper()}] su [{selected_model}]")
-        print(f"📁 Checkpoint destinazione: {checkpoint_file}")
-        print("=" * 80)
-
-        results = []
-        processed_ids = set()
-
-        # Ripristino da checkpoint esistente in formato fmt2
-        if os.path.exists(checkpoint_file):
-            try:
-                with open(checkpoint_file, 'r', encoding='utf-8') as f:
-                    existing_data = json.load(f)
-                    results = existing_data.get("results", [])
-                    processed_ids = {str(r["id"]) for r in results}
-                    print(f"🔄 Checkpoint ripristinato: {len(results)}/{total_records} completati.")
-            except Exception as e:
-                print(f"⚠️ Errore caricamento checkpoint ({e}). Si riparte da zero.")
-
-        if len(results) >= total_records:
-            print(f"✅ Esperimento per [{selected_model}] già COMPLETATO al 100% ({len(results)}/{total_records}). Salto al successivo.")
-            continue
-
-        # Inizializzazione struttura metadata fmt2
-        fmt2_data = {
-            "metadata": {
-                "model": {
-                    "provider": "deepinfra", 
-                    "model_id": selected_model
-                },
-                "protocol": {
-                    "mode": EXECUTION_MODE, 
-                    "experiment_tag": EXPERIMENT_TAG, 
-                    "input_column": "source"
-                },
-                "dataset": {
-                    "total_records": total_records
-                }
-            },
-            "results": results
+    if not y_true:
+        return {
+            "model_id": model_id,
+            "provider": provider,
+            "mode": protocol_mode,
+            "tag": experiment_tag,
+            "evaluated_samples": 0,
+            "status": "No valid data"
         }
 
-        # Selezione dei record non ancora processati per prevenire l'overflow
-        unprocessed_df = df_test[~df_test['dataset_index'].astype(str).isin(processed_ids)]
+    # Calcolo Metriche
+    acc = accuracy_score(y_true, y_pred)
+    
+    p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0
+    )
+    
+    p_weighted, r_weighted, f1_weighted, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="weighted", zero_division=0
+    )
 
-        start_time = time.time()
+    avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+    coverage_rate = (len(y_true) / total_records) * 100 if total_records > 0 else 0.0
 
+    return {
+        "model_id": model_id,
+        "provider": provider,
+        "mode": protocol_mode,
+        "experiment_tag": experiment_tag,
+        "total_expected": total_records,
+        "evaluated_samples": len(y_true),
+        "errors": error_count,
+        "coverage_pct": round(coverage_rate, 2),
+        "accuracy": round(acc, 4),
+        "f1_macro": round(f1_macro, 4),
+        "precision_macro": round(p_macro, 4),
+        "recall_macro": round(r_macro, 4),
+        "f1_weighted": round(f1_weighted, 4),
+        "precision_weighted": round(p_weighted, 4),
+        "recall_weighted": round(r_weighted, 4),
+        "avg_latency_sec": round(avg_latency, 3),
+        "file_name": os.path.basename(filepath)
+    }
+
+
+# ==============================================================================
+# MAIN BATCH
+# ==============================================================================
+def main():
+    # Pattern aggiornato: cerca solo i file fmt2 che contengono news1000 o news-1000
+    pattern_1 = os.path.join(CHECKPOINT_DIR, f"checkpoint-*-*{EXPERIMENT_FILTER_TAG}*.json")
+    pattern_2 = os.path.join(CHECKPOINT_DIR, "checkpoint-*-*news-1000*.json")
+    
+    json_files = sorted(list(set(glob.glob(pattern_1) + glob.glob(pattern_2))))
+
+    if not json_files:
+        print(f"⚠️ Nessun file checkpoint trovato in '{CHECKPOINT_DIR}' contenente 'news1000' o 'news-1000'.")
+        return
+
+    print("=" * 100)
+    print(f"📊 EVALUATION BATCH FMT2 | Target: Benchmark {EXPERIMENT_FILTER_TAG} (1.000 articoli)")
+    print(f"📁 Trovati {len(json_files)} file di checkpoint validi.")
+    print("=" * 100)
+
+    summary_list = []
+    for file_path in json_files:
         try:
-            for idx, row in unprocessed_df.iterrows():
-                if len(results) >= total_records:
-                    break
+            metrics = evaluate_checkpoint_fmt2(file_path)
+            summary_list.append(metrics)
+        except Exception as e:
+            print(f"⚠️ Errore durante l'elaborazione di {file_path}: {e}")
 
-                record_id = str(row.get("dataset_index", idx))
-                news_text = str(row["source"])
-                true_category = str(row["category"]).strip().lower()
+    df_metrics = pd.DataFrame(summary_list)
+    
+    if "f1_macro" in df_metrics.columns:
+        df_metrics = df_metrics.sort_values(by=["mode", "f1_macro"], ascending=[True, False])
 
-                prompt = build_prompt(news_text, mode=EXECUTION_MODE, fewshot_context=fewshot_context)
-                raw_prediction, latency = predict_category(prompt, selected_model)
+    # Salvataggio CSV
+    df_metrics.to_csv(OUTPUT_SUMMARY_CSV, index=False, encoding="utf-8")
 
-                if raw_prediction == "ERRORE":
-                    status = "error"
-                    pred_category = "ERRORE"
-                else:
-                    status = "ok"
-                    pred_category = clean_and_map_category(raw_prediction)
-
-                # Struttura del singolo record fmt2
-                record = {
-                    "id": record_id,
-                    "status": status,
-                    "source_text": news_text,
-                    "true_category": true_category,
-                    "pred_category": pred_category,
-                    "pred_raw": raw_prediction,
-                    "latency_seconds": round(latency, 4)
-                }
-
-                results.append(record)
-                fmt2_data["results"] = results
-                processed_ids.add(record_id)
-
-                print(".", end="", flush=True)
-
-                # Salvataggio incrementale
-                if len(results) % CHECKPOINT_EVERY == 0 or len(results) == total_records:
-                    with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                        json.dump(fmt2_data, f, ensure_ascii=False, indent=2)
-                    print(f"\n💾 Checkpoint salvato: {len(results)}/{total_records} | File: {checkpoint_file}")
-
-                time.sleep(0.1)
-
-            # Salvataggio finale
-            with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(fmt2_data, f, ensure_ascii=False, indent=2)
-
-        except KeyboardInterrupt:
-            print(f"\n🛑 Interrotto dall'utente durante [{selected_model}].")
-            with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(fmt2_data, f, ensure_ascii=False, indent=2)
-            print(f"💾 Checkpoint salvato ({len(results)}/{total_records} salvati). Arresto del batch.")
-            sys.exit(0)
-
-        print(f"\n🎉 COMPLETATO [{EXECUTION_MODE.upper()}-{EXPERIMENT_TAG.upper()}] per [{selected_model}] in {time.time() - start_time:.1f}s")
-
-    print("\n" + "=" * 80)
-    print("🏁 TUTTI GLI ESPERIMENTI SONO STATI COMPLETATI CON SUCCESSO!")
-    print("=" * 80)
+    # Output Console
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 1000)
+    
+    print("\n" + df_metrics.to_string(index=False))
+    print("\n" + "=" * 100)
+    print(f"💾 Report salvato in: {OUTPUT_SUMMARY_CSV}")
+    print("=" * 100)
 
 
 if __name__ == "__main__":
