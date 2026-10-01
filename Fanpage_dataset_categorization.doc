@@ -1,0 +1,331 @@
+# Costruzione del dataset Fanpage per la classificazione delle news
+
+## 1. Obiettivo
+
+Per gli esperimenti di classificazione delle news è stata costruita una base dati derivata dal dataset pubblico **ARTeLab/fanpage**. Il dataset originario è stato concepito per un task di summarization e contiene, tra gli altri, due campi fondamentali:
+
+* `source`, contenente il testo dell'articolo;
+* `target`, contenente il relativo testo target utilizzato per il task di summarization.
+
+L'obiettivo del presente lavoro era trasformare parte di questo corpus in un dataset utilizzabile per un diverso task, ossia la **classificazione tematica delle notizie**.
+
+Il dataset originale non forniva direttamente l'etichetta tematica necessaria. È stato pertanto necessario ricostruire tale informazione individuando, quando possibile, la pagina originale dell'articolo sul sito Fanpage e derivandone la categoria editoriale.
+
+La procedura ha richiesto diverse fasi: ricerca degli articoli sul Web, estrazione della categoria dagli URL, gestione dei fallimenti e del rate limiting dei motori di ricerca, deduplicazione, individuazione di record contaminati da frammenti di codice Web, definizione della tassonomia finale e costruzione di split train/dev/test riproducibili.
+
+## 2. Dataset di partenza
+
+Il corpus Fanpage originale contiene circa **67.500 articoli**. Durante le prime sperimentazioni si è lavorato direttamente sullo split `train` del dataset, costituito da 67.492 record.
+
+Ai fini del nuovo task sono stati mantenuti integralmente i campi:
+
+* `source`, destinato a costituire l'input del classificatore;
+* `target`, conservato per compatibilità con il dataset originale e per eventuali esperimenti successivi.
+
+A questi sono stati progressivamente aggiunti campi relativi alla procedura di recupero:
+
+* `dataset_index`, indice dell'articolo nel corpus originale;
+* `query`, query utilizzata per la ricerca;
+* `url`, URL Fanpage recuperato;
+* `url_category`, categoria ricavata dall'URL;
+* `rank`, posizione del risultato selezionato;
+* `status`, stato della procedura di recupero.
+
+Il campo `dataset_index` ha assunto particolare importanza perché permette di mantenere una corrispondenza stabile tra il corpus originale, i checkpoint intermedi e gli split sperimentali.
+
+## 3. Ricerca degli articoli originali
+
+Per associare ogni testo alla propria categoria editoriale si è cercato di individuare sul Web l'articolo Fanpage corrispondente al contenuto presente in `source`.
+
+La ricerca è stata inizialmente effettuata mediante la libreria **DDGS**, costruendo query limitate al dominio:
+
+`site:fanpage.it`
+
+seguite da una porzione significativa del testo dell'articolo.
+
+Durante lo sviluppo sono state sperimentate diverse strategie di costruzione della query. Le prime versioni utilizzavano sequenze relativamente lunghe di parole dell'articolo; successivamente sono state sperimentate normalizzazioni, rimozione delle stopword e query basate su termini selezionati.
+
+L'analisi dei risultati ha mostrato tuttavia che query eccessivamente lunghe o fortemente trasformate potevano ridurre la capacità del motore di individuare l'articolo corretto. La strategia è stata quindi semplificata privilegiando una **singola query breve, costituita da una porzione relativamente naturale del testo originale**.
+
+La procedura è stata inoltre progettata in modo conservativo: quando non era possibile individuare con sufficiente affidabilità un URL Fanpage, il record non veniva categorizzato.
+
+## 4. Estrazione della categoria dall'URL
+
+Una volta individuato l'articolo, la categoria è stata ricavata direttamente dalla struttura dell'URL Fanpage.
+
+Nel corpus sono presenti almeno due convenzioni storiche.
+
+Per gli URL più recenti la categoria compare normalmente nel primo elemento del percorso:
+
+`https://www.fanpage.it/politica/...` → `politica`
+
+`https://www.fanpage.it/attualita/...` → `attualita`
+
+Per numerosi articoli più vecchi la categoria è invece espressa mediante un sottodominio:
+
+`https://donna.fanpage.it/...` → `donna`
+
+`https://music.fanpage.it/...` → `music`
+
+`https://cinema.fanpage.it/...` → `cinema`
+
+`https://design.fanpage.it/...` → `design`
+
+La funzione di estrazione è stata pertanto progettata per gestire entrambe le strutture.
+
+Nelle fasi iniziali erano state considerate anche altre possibili sorgenti della categoria presenti nell'HTML della pagina. Successivamente, poiché l'URL si è dimostrato una sorgente semplice e generalmente consistente, la procedura definitiva ha utilizzato **`url_category` come ground truth della classificazione**.
+
+## 5. Checkpoint e ripresa dell'elaborazione
+
+La ricerca sul Web è un processo relativamente lento e soggetto a errori temporanei. Per evitare di perdere il lavoro già svolto è stato introdotto un sistema di **checkpoint incrementale**.
+
+Dopo ogni articolo processato vengono conservati il testo originale, la query, l'eventuale URL, la categoria, il rank del risultato e lo stato della ricerca.
+
+In caso di interruzione, l'elaborazione può quindi riprendere dagli articoli non ancora processati o da quelli privi di URL, senza rieseguire le ricerche già concluse con successo.
+
+Questo meccanismo si è rivelato particolarmente importante nelle successive fasi di retry.
+
+## 6. Rate limiting e strategia di retry
+
+Durante i primi run il tasso osservato di recupero degli URL si era stabilizzato intorno al 20–25%. In una fase successiva il rendimento era addirittura precipitato quasi a zero, nonostante verifiche manuali mostrassero che numerosi articoli apparentemente non trovati erano ancora disponibili e facilmente reperibili mediante una normale ricerca Web.
+
+Sono stati effettuati diversi test diagnostici. Query note e correttamente formulate restituivano sistematicamente `DDGSException: No results found` su diversi backend. Anche l'accesso programmatico diretto a Google ha prodotto una risposta HTTP `429`, indicativa di limitazione del traffico automatizzato.
+
+Questi risultati hanno evidenziato che una parte consistente dei fallimenti osservati non rappresentava l'assenza degli articoli, ma era legata a **rate limiting e limitazioni dell'accesso automatizzato ai motori di ricerca**.
+
+La procedura è stata pertanto modificata adottando pass successivi di retry esclusivamente sui record ancora privi di URL. I successi già ottenuti non vengono mai rimessi in discussione.
+
+Sono state inoltre aumentate significativamente le pause tra le richieste. In una fase successiva è stato utilizzato un **residential proxy**, che ha consentito di superare buona parte delle limitazioni precedentemente osservate e di aumentare sensibilmente il numero degli articoli recuperati.
+
+Questo risultato ha mostrato che il tasso di recupero inizialmente osservato era fortemente sottostimato a causa delle limitazioni del motore di ricerca. Le osservazioni successive suggeriscono un'efficacia potenziale del recupero sensibilmente superiore, nell'ordine dell'85%; tale valore deve tuttavia essere considerato una stima operativa finché l'elaborazione dell'intero corpus non sarà completata.
+
+## 7. Evoluzione del corpus recuperato
+
+L'effetto dei retry è stato considerevole.
+
+In una fase intermedia erano disponibili circa 4.100 articoli puliti appartenenti alle categorie selezionate. Con i pass successivi il corpus è cresciuto rapidamente.
+
+Nel checkpoint `retry12`, ad esempio, erano stati recuperati 8.465 record con `source`, URL e categoria disponibili. Dopo il filtro sulle categorie principali e la deduplicazione erano disponibili 7.449 articoli utilizzabili.
+
+Il successivo processo di cleaning e il checkpoint `retry13` hanno prodotto **7.533 esempi main-category deduplicati**.
+
+Un risultato metodologicamente rilevante è che i retry non hanno semplicemente aumentato il numero degli esempi, ma hanno anche modificato la distribuzione delle categorie. Alcune classi, quali `gossip`, `music`, `cinema` e `donna`, sono cresciute molto più rapidamente rispetto alle prime fasi.
+
+Questo suggerisce che il processo di retrieval possa introdurre un **selection bias**: la probabilità che un articolo venga recuperato dal motore di ricerca non è necessariamente uniforme rispetto alla categoria, al periodo di pubblicazione o alla struttura storica del sito. I retry contribuiscono quindi non soltanto ad aumentare la dimensione del corpus, ma anche a ridurre questa distorsione.
+
+## 8. Definizione della tassonomia
+
+Gli URL recuperati contenevano numerose categorie e sottocategorie Fanpage. Non tutte erano appropriate per il task di classificazione generale delle news.
+
+Sono state escluse, ad esempio, categorie geografiche o sezioni particolari quali `milano`, `roma`, `napoli`, `youmedia`, `live`, `story` e altre categorie non appartenenti alla tassonomia principale scelta per gli esperimenti.
+
+La tassonomia finale comprende **18 categorie**:
+
+1. `attualita`
+2. `cinema`
+3. `cultura`
+4. `design`
+5. `diritto`
+6. `donna`
+7. `economia`
+8. `esteri`
+9. `gossip`
+10. `innovazione`
+11. `music`
+12. `politica`
+13. `scienze`
+14. `spettacolo`
+15. `sport`
+16. `stile-e-trend`
+17. `tech`
+18. `travel`
+
+Nel corpus `retry13` pulito e deduplicato la distribuzione comprende, tra le altre, 805 notizie `gossip`, 795 `music`, 733 `attualita`, 564 `cinema`, 544 `politica`, 540 `sport`, 537 `design`, 537 `donna` e 508 `scienze`. Le classi meno frequenti sono `economia` con 52 esempi e `innovazione` con 106.
+
+Il dataset conserva intenzionalmente questo sbilanciamento anziché effettuare oversampling o undersampling artificiale.
+
+## 9. Deduplicazione
+
+Prima della costruzione degli split vengono effettuati controlli sui duplicati.
+
+In particolare vengono verificati:
+
+* `dataset_index`;
+* testo `source`;
+* URL.
+
+Nel checkpoint `retry13` pulito, dopo il filtro delle categorie principali, erano presenti 7.586 record. Sono stati individuati 53 duplicati del `source` e 222 URL duplicati; dopo la deduplicazione sono rimasti **7.533 esempi**.
+
+La deduplicazione è particolarmente importante per evitare che articoli identici o sostanzialmente equivalenti compaiano contemporaneamente nel training set e nel test set, producendo una sovrastima delle prestazioni.
+
+## 10. Individuazione e rimozione della contaminazione Web
+
+Durante l'ispezione del corpus è stata rilevata la presenza, in un numero limitato di `source`, di frammenti provenienti direttamente dal codice delle pagine Web.
+
+I pattern comprendevano principalmente JavaScript, con riferimenti quali:
+
+* `window.*`;
+* `document.*`;
+* dichiarazioni `var`, `let` o `const`;
+* funzioni JavaScript;
+* `googletag`;
+* codice relativo a embed di Facebook.
+
+È stato quindi sviluppato un tool specifico di cleaning.
+
+La scelta metodologica è stata deliberatamente conservativa: **i record contaminati non vengono riparati**, ma esclusi integralmente dal corpus. In questo modo si evita di introdurre trasformazioni euristiche del testo che potrebbero modificare il contenuto informativo originale.
+
+Applicando il cleaner al checkpoint `retry13`, su 21.101 record complessivi ne sono stati mantenuti **20.935** ed esclusi **166**, corrispondenti allo **0,787%** del corpus.
+
+I 166 record esclusi presentavano tutti firme riconducibili a funzioni JavaScript; 162 contenevano anche pattern `document`, `googletag`, variabili JavaScript e `window`, mentre cinque presentavano codice relativo a embed Facebook.
+
+Il tool produce separatamente:
+
+* il checkpoint pulito;
+* il CSV dei record esclusi;
+* un report del cleaning.
+
+Gli esclusi vengono quindi conservati per finalità di audit e riproducibilità.
+
+## 11. Ordine definitivo delle operazioni
+
+La pipeline di preprocessing risultante è:
+
+**checkpoint del crawler → cleaning → filtro delle 18 categorie → deduplicazione → costruzione degli split**
+
+L'ordine è importante. In particolare il cleaning viene effettuato **prima** della costruzione di train, development e test, evitando che record contaminati possano entrare nel benchmark.
+
+## 12. Costruzione degli split congelati
+
+Con l'aumento della quantità di dati recuperati è emersa l'esigenza di mantenere stabile il benchmark anche mentre il crawler continuava a recuperare nuovi articoli.
+
+È stato quindi implementato un sistema di **frozen split**.
+
+La configurazione attuale prevede:
+
+* **2.000 articoli di test**;
+* **1.000 articoli di development**;
+* **tutti gli esempi rimanenti nel training set**.
+
+Test e development vengono selezionati in maniera stratificata rispetto alle 18 categorie e identificati persistentemente mediante `dataset_index`.
+
+Gli identificativi vengono memorizzati nel file:
+
+`frozen_split.json`
+
+Una volta creato tale file, i successivi aggiornamenti del corpus non modificano più dev e test: ogni nuovo articolo eleggibile confluisce automaticamente nel training set.
+
+Sul checkpoint `retry13_clean` il master finale utilizzato per la creazione iniziale dello split congelato comprendeva **7.533 articoli**, suddivisi in:
+
+* **4.533 train**;
+* **1.000 dev**;
+* **2.000 test**.
+
+Il preparatore verifica inoltre esplicitamente l'assenza di sovrapposizioni tra i tre insiemi.
+
+## 13. Distribuzione del test set
+
+Il test set congelato da 2.000 articoli mantiene sostanzialmente la distribuzione del corpus.
+
+Le classi più numerose sono:
+
+* `gossip`: 214;
+* `music`: 211;
+* `attualita`: 195;
+* `cinema`: 150;
+* `politica`: 144;
+* `design`: 143;
+* `sport`: 143;
+* `donna`: 142;
+* `scienze`: 135.
+
+Le categorie meno rappresentate sono:
+
+* `travel`: 44;
+* `innovazione`: 28;
+* `economia`: 14.
+
+La distribuzione completa è riportata dall'output del preparatore.
+
+La presenza di classi con numerosità molto diversa rende opportuno non limitare la valutazione alla sola accuracy, ma considerare anche metriche macro-aggregate.
+
+## 14. Ruolo dei tre split
+
+I tre insiemi hanno ruoli distinti.
+
+Il **training set** non viene necessariamente utilizzato per modificare i pesi dei Large Language Model. Nel contesto degli esperimenti previsti rappresenta soprattutto il pool dal quale vengono estratti gli esempi utilizzati nel few-shot prompting e nel semantic retrieval.
+
+Il **development set** viene utilizzato per scegliere le configurazioni sperimentali, ad esempio:
+
+* struttura del prompt;
+* numero di esempi few-shot;
+* numero di vicini semantici;
+* eventuale strategia di rifiuto;
+* parametri del retrieval.
+
+Il **test set** viene invece mantenuto completamente separato e utilizzato esclusivamente per la valutazione finale.
+
+## 15. Preparazione al few-shot e al semantic few-shot
+
+Per gli esperimenti successivi è stata progettata una fase di augmentation del test set.
+
+Per ogni articolo di test verranno associati due insiemi persistenti di contesti:
+
+* fino a **otto esempi casuali** estratti dal training set;
+* fino a **otto esempi semanticamente simili** recuperati dal training set.
+
+La configurazione sperimentale iniziale utilizzerà soltanto i primi **tre esempi**, realizzando quindi un confronto 3-shot a parità di budget di contesto.
+
+La memorizzazione di otto esempi permette tuttavia di effettuare successivamente esperimenti 1-shot, 3-shot, 5-shot o 8-shot senza ripetere il retrieval.
+
+Per ogni vicino semantico verranno memorizzati almeno:
+
+* `rank`;
+* `dataset_index`;
+* `category`;
+* `similarity`;
+* `embedding_model`;
+* `source`.
+
+In questo modo il processo di retrieval rimane completamente tracciabile.
+
+L'augmentation definitiva viene effettuata soltanto dopo aver stabilizzato il training pool, poiché l'aumento del numero di articoli disponibili può modificare i top-k vicini semantici.
+
+## 16. Protocollo sperimentale previsto
+
+Il dataset è stato progettato per confrontare almeno quattro condizioni:
+
+1. **zero-shot a classi chiuse**, in cui il modello deve scegliere una delle 18 categorie;
+2. **zero-shot con possibilità di rifiuto**, in cui il modello può dichiarare che l'articolo non è assegnabile con sufficiente affidabilità a una delle categorie;
+3. **3-shot random**, utilizzando tre esempi estratti dal training set;
+4. **3-shot semantic**, utilizzando i primi tre tra gli otto esempi semanticamente più vicini precedentemente calcolati.
+
+L'originaria ipotesi di fornire un esempio per ciascuna delle 18 categorie è stata abbandonata perché avrebbe prodotto prompt eccessivamente grandi e un confronto poco realistico.
+
+L'utilizzo dello stesso test set congelato consente di confrontare direttamente modelli e strategie di prompting.
+
+## 17. Metriche previste
+
+A causa dello sbilanciamento delle classi, la sola accuracy non è sufficiente.
+
+Le metriche previste comprendono almeno:
+
+* accuracy;
+* macro-F1;
+* weighted-F1;
+* matrice di confusione.
+
+La **macro-F1** assume particolare importanza perché attribuisce lo stesso peso a ciascuna categoria indipendentemente dalla sua frequenza.
+
+Per gli esperimenti con possibilità di rifiuto verranno inoltre considerate:
+
+* coverage;
+* reject rate;
+* accuracy sui soli esempi accettati;
+* macro-F1 sui soli esempi accettati.
+
+## 18. Riproducibilità e tracciabilità
+
+La pipeline è stata progettata affinché ogni trasformazione significativa sia tracciabile.
+
+Sono c
